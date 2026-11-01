@@ -1,0 +1,22 @@
+# SECRETS — never in Git (rule R15)
+secrets/
+credentials.json
+client_secret.json
+upload_token.json
+site_auth.json
+*.pem
+id_*
+.env
+# data and local work files (live on the PC / Drive / site, not in Git)
+HC/
+_archive/
+__pycache__/
+*.pyc
+flights_state.json
+migration_state.json
+*.log
+broken_links_report*
+orphans_report_*
+*.xlsx
+*.pdf
+*.zip
