@@ -2,11 +2,9 @@
 
 Выполненное — в журнал и STATE, отсюда убирается. Создан 01.11.2026.
 
-## Сейчас (по порядку)
-1. Alex: хэш нового `flights.py` на ПК (команда в `docs/LAUNCH-INSTRUCTION.md`), сравнить с STATE 1.
-2. Alex: пробный запуск `3_tidy_folder.ps1` без `-Go`, прислать вывод; Claude сверяет список; затем запуск с `-Go`.
-3. Alex: проверка BAT по порядку: `2_upload_to_site.bat` (пока очередь пуста/ответ «нет») → `1_add_flight.bat` (один из ожидающих перелётов) → `2_upload_to_site.bat` («да») → проверка сайта. Результат — Claude; при ошибке входа по ssh на Амстердам — отдельный серверный шаг через сессию VPN.
-4. Claude: зафиксировать результат в STATE/журнале; закрыть перелёты.
+## Сейчас
+- Перелёты закрыты 01.11 (STATE 0.5). Новые билеты: JSON (Claude в чате) → `1_add_flight.bat` → `2_upload_to_site.bat`.
+- Убрать в `_archive` на ПК `flights_v1.4_old.py` и `3_tidy_folder.ps1` (по слову Alex).
 
 ## Хвосты по перелётам
 - Нет PDF `2024_16-02_Sochi-Moscow…FL1KLL.pdf`: корзина Drive, `broken_links_report.csv`.
