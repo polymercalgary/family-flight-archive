@@ -149,6 +149,7 @@ g = FakeGoogle()
 calls = []
 class R:
     def __init__(self, rc=0, out="", err=""): self.returncode, self.stdout, self.stderr = rc, out, err
+SERVER_LS = "2026 2\n"
 def fake_run(cmd):
     calls.append(cmd)
     if cmd[0] == "ssh" and "systemctl cat" in cmd[-1] and "journalctl" in cmd[-1]:
@@ -156,11 +157,19 @@ def fake_run(cmd):
     if cmd[0] == "ssh" and "hostname -I" in cmd[-1]:
         return R(0, "88.216.61.42\nHC_FOLDER_OK\n")
     if cmd[0] == "ssh" and "ls $d" in cmd[-1]:
-        return R(0, "2026 2\n")
+        return R(0, SERVER_LS)
     return R(0)
 F.run = fake_run
 F.socket.gethostbyname = lambda h: "88.216.61.42"   # v1.5 server_check
 F.http_code = lambda url: "200"
+SITE_OVERRIDE = {}
+def fake_http_get(url):
+    y = int(url.rstrip("/").split("/")[-1])
+    n = SITE_OVERRIDE.get(y, len(g.links.get(y, [])))
+    if n == "404":
+        return ("404", "")
+    return ("200", '<p class="count">%s records</p>' % n)
+F.http_get = fake_http_get
 F.pick_files = lambda: [str(pdf)]
 answers = []
 builtins.input = lambda prompt="": answers.pop(0)
@@ -262,6 +271,66 @@ check((len(g.inserted), len(g.uploaded), len(g.created_sheets)) == before and no
 check("2026:" in outp and "Сайт / -> 200" in outp, "K2 check report printed")
 check("имя в таблице != имя на Диске 0" in outp and "ИТОГ: ✅" in outp, "K3 check compares table names with Drive names and PDF type")
 print("\n".join("    " + l for l in outp.splitlines()[:8]))
+# ---------------- v1.6: site vs table comparison
+check(F.parse_site_records('<p class="count">743 records</p>') == 743 and F.parse_site_records("<html></html>") is None,
+      "C1 'N records' parsed from the year page")
+cl = F.classify_year
+check(cl(10, 10, 5, 5)[0] == "ok", "C2 equal rows and files -> ok")
+check(cl(10, 7, 5, 5)[0] == "plus", "C3 site has fewer rows than table -> plus (publish)")
+check(cl(10, 10, 5, 3)[0] == "plus", "C4 server has fewer files than table links -> plus")
+check(cl(10, 12, 5, 5)[0] == "minus", "C5 site has MORE rows than table -> minus (do not publish)")
+st_, why_ = cl(10, 10, 5, 9)
+check(st_ == "ok" and any("старые имена" in w for w in why_), "C6 extra files on server -> info only, not an error")
+check(cl(10, "missing", 5, 5)[0] == "plus" and cl(0, "missing", 0, 0)[0] == "ok", "C7 year page absent -> plus only if the table has rows")
+check(cl(10, None, 5, 5)[0] == "unknown", "C8 page unreadable -> unknown, never auto-publish")
+check(cl(10, 10, 5, None)[0] == "ok", "C9 server files unknown (no ssh answer) -> rows alone decide")
+check(cl(10, 12, 5, 3)[0] == "minus", "C10 rows minus and files plus together -> minus wins (stop and investigate)")
+# update_dirty end to end (fake site / fake server)
+n26 = len(g.links[2026]); f26 = len(F.files_map_for(g.links[2026]))
+n27 = len(g.links.get(2027, [])); f27 = len(F.files_map_for(g.links.get(2027, [])))
+SERVER_LS = "2026 %d\n2027 %d\n" % (f26, f27)
+SITE_OVERRIDE.clear(); SITE_OVERRIDE[2026] = n26 - 1
+F.save_state({"dirty_years": [], "history": []})
+calls.clear()
+answers[:] = ["да"]
+buf = io.StringIO(); old = sys.stdout; sys.stdout = buf
+try:
+    F.update_dirty(g)
+finally:
+    sys.stdout = old
+o6 = buf.getvalue()
+check("ПЛЮС" in o6 and "добавлены в очередь" in o6 and any(c[0] == "scp" and c[-1].endswith("/root/HC/2026/") for c in calls),
+      "C11 empty queue but site has fewer rows than table -> year queued by itself and published")
+check(F.load_state()["dirty_years"] == [], "C12 queue cleared after successful publish")
+SITE_OVERRIDE[2026] = n26 + 1
+calls.clear(); answers[:] = []
+buf = io.StringIO(); sys.stdout = buf
+try:
+    F.update_dirty(g)
+finally:
+    sys.stdout = old
+o7 = buf.getvalue()
+check("МИНУС" in o7 and not any(c[0] == "scp" for c in calls), "C13 site has more rows than table -> warning, no publish, no question asked")
+SITE_OVERRIDE.clear()
+calls.clear(); answers[:] = []
+buf = io.StringIO(); sys.stdout = buf
+try:
+    F.update_dirty(g)
+finally:
+    sys.stdout = old
+check("Изменённых годов нет, сайт совпадает с таблицами" in buf.getvalue() and not any(c[0] == "scp" for c in calls),
+      "C14 everything matches -> nothing to publish")
+_old_run = F.run
+F.run = lambda cmd: (calls.append(cmd) or R(255, "", "Permission denied")) if cmd[0] == "ssh" else _old_run(cmd)
+calls.clear(); answers[:] = []
+buf = io.StringIO(); sys.stdout = buf
+try:
+    F.update_dirty(g)
+finally:
+    sys.stdout = old
+F.run = _old_run
+check(not any(c[0] == "scp" for c in calls), "C15 no ssh -> stopped before comparing and publishing")
+SERVER_LS = "2026 2\n"
 # ---------------- time zones (v1.4)
 RZD = {"segments": [{"Travel Date": "2026-10-06", "Time Depart": "14:40", "From": "Moscow", "To": "Ryazan",
                      "Arrival Date": "2026-10-06", "Time Arrival": "17:05", "Flight Number": "070"}],

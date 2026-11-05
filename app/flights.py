@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-flights.py v1.5 — единая программа архива перелётов (заменяет add_flight_v2.py + generate_site.py).
+flights.py v1.6 — единая программа архива перелётов (заменяет add_flight_v2.py + generate_site.py).
 
 Меню:  python flights.py     Из BAT: python flights.py add (добавить перелёт) | python flights.py upload (обновить сайт)
   1) Добавить перелёт: вставить JSON (стандартная схема) -> проверка по правилам -> выбрать PDF
@@ -50,6 +50,13 @@ flights.py v1.5 — единая программа архива перелёт�
     /root/HC; нет входа или папки — публикация не начинается, годы остаются в очереди.
     ssh/scp с StrictHostKeyChecking=accept-new (новый сервер принимается при первом входе, подмена ключа — нет).
     Запуск из BAT: «flights.py add» и «flights.py upload» (один пункт и выход); меню без аргументов — как раньше.
+  - v1.6: «Обновить сайт» (BAT 2, пункт 2) и «Проверка» (пункт 4) сверяют сайт с таблицами, а не только
+    список изменённых годов на ПК: по каждому году — строки в таблице и «N records» на странице сайта,
+    файлы по ссылкам и файлы на сервере. На сайте меньше, чем в таблице (ПЛЮС в таблице: добавили, на сайт не
+    попало, или сервер откатили) — год сам попадает в очередь на публикацию. На сайте БОЛЬШЕ, чем в таблице
+    (МИНУС: строки пропали из таблицы) — публикация этого года не предлагается, показано предупреждение:
+    сначала найти и восстановить, иначе сайт повторил бы потерю. Лишние файлы на сервере (старые имена) —
+    только справка, на сервере ничего не удаляется.
   - Сайт: на сервере ничего не удаляется; в zip года — только файлы, на которые есть ссылки в таблице.
   - После успешной публикации — копия сайта на сервере (служба virlab-flights-backup.service),
     если она уже установлена.
@@ -83,7 +90,7 @@ from datetime import date, datetime, time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "1.5"
+VERSION = "1.6"
 HERE = Path(__file__).resolve().parent
 SECRETS = HERE / "secrets"
 SA_FILE = SECRETS / "credentials.json"
@@ -965,6 +972,20 @@ def http_code(url):
         return "ERR " + type(e).__name__
 
 
+def http_get(url):
+    """v1.6: (код, текст страницы). Ошибка сети -> ("ERR ...", "")."""
+    user, pw = site_auth()
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("Authorization", "Basic " + base64.b64encode(("%s:%s" % (user, pw)).encode()).decode())
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return str(r.status), r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return str(e.code), ""
+    except Exception as e:  # noqa
+        return "ERR " + type(e).__name__, ""
+
+
 # ---- HTML (шаблон generate_site.py 21.09 без изменений вида)
 DOWNLOAD_SVG = '''<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>'''
 PAGE_CSS = """
@@ -1553,10 +1574,10 @@ def check(g):
     for y, sid in sheets.items():
         if y in KNOWN_SPREADSHEET_IDS and KNOWN_SPREADSHEET_IDS[y] != sid:
             print("  ⚠️ %d: найдена таблица %s, а в программе записана %s" % (y, sid, KNOWN_SPREADSHEET_IDS[y]))
-    srv = ssh("cd %s && for d in 20[0-9][0-9]; do printf '%%s %%s\\n' $d $(ls $d/${d}_files 2>/dev/null | wc -l); done" % REMOTE_HC_ROOT)
-    server_counts = dict(l.split() for l in (srv.stdout or "").splitlines() if len(l.split()) == 2)
-    if srv.returncode != 0:
-        print("  ⚠️ сервер: %s" % srv.stderr.strip())
+    server_counts = server_file_counts()
+    if server_counts is None:
+        print("  ⚠️ сервер: файлы на сервере не прочитаны")
+        server_counts = {}
     total_bad = 0
     for y, sid in sheets.items():
         rows = g.link_rows(sid)
@@ -1589,6 +1610,7 @@ def check(g):
             m = metas[list(fmap).index(fid)]
             print("      ! таблица: %s | Диск: %s" % (names.get(fid), m.get("name")))
     print("Сайт / -> %s" % http_code(SITE_BASE + "/"))
+    print_site_vs_table(site_vs_table(g))
     if UPLOAD_TOKEN_FILE.exists():
         age = (datetime.now() - datetime.fromtimestamp(UPLOAD_TOKEN_FILE.stat().st_mtime)).days
         print("Вход для загрузки: токен есть, обновлён %d дн. назад (при истечении программа сама откроет вход)" % age)
@@ -1622,18 +1644,115 @@ def upload_test(g):
         os.unlink(path)
 
 
+RECORDS_RE = re.compile(r'class="count">\s*(\d+)\s+records')
+
+
+def parse_site_records(html):
+    """Число «N records» со страницы года на сайте или None."""
+    m = RECORDS_RE.search(html or "")
+    return int(m.group(1)) if m else None
+
+
+def classify_year(table_rows, site_rows, table_files, server_files):
+    """v1.6. site_rows: число | "missing" (страницы нет) | None (не удалось прочитать).
+    server_files: число | None (сервер не ответил). Возвращает (статус, причины):
+    ok | plus (в таблице больше, чем на сайте — публиковать) | minus (на сайте больше — искать потерю) | unknown."""
+    plus, minus, info = [], [], []
+    if site_rows is None:
+        return "unknown", ["страницу года на сайте прочитать не удалось"]
+    if site_rows == "missing":
+        if table_rows > 0:
+            plus.append("страницы года нет на сайте, а в таблице %d строк" % table_rows)
+    else:
+        if site_rows < table_rows:
+            plus.append("строк: в таблице %d, на сайте %d" % (table_rows, site_rows))
+        elif site_rows > table_rows:
+            minus.append("строк: в таблице %d, на сайте %d" % (table_rows, site_rows))
+    if server_files is not None:
+        if server_files < table_files:
+            plus.append("файлов: по ссылкам таблицы %d, на сервере %d" % (table_files, server_files))
+        elif server_files > table_files:
+            info.append("на сервере файлов больше (%d, по ссылкам %d) — старые имена, не удаляются" % (server_files, table_files))
+    if minus:
+        return "minus", minus + plus + info
+    if plus:
+        return "plus", plus + info
+    return "ok", info
+
+
+SERVER_COUNT_CMD = "cd %s && for d in 20[0-9][0-9]; do printf '%%s %%s\\n' $d $(ls $d/${d}_files 2>/dev/null | wc -l); done" % REMOTE_HC_ROOT
+
+
+def server_file_counts():
+    """{год(str): число файлов} или None, если сервер не ответил."""
+    r = ssh(SERVER_COUNT_CMD)
+    if r.returncode != 0:
+        return None
+    return dict(l.split() for l in (r.stdout or "").splitlines() if len(l.split()) == 2)
+
+
+def site_vs_table(g):
+    """v1.6, ТОЛЬКО ЧТЕНИЕ: сверка каждого года таблицы с сайтом."""
+    counts = server_file_counts()
+    res = []
+    for y, sid in sorted(g.year_sheets().items()):
+        rows = g.link_rows(sid)
+        fmap = files_map_for(rows)
+        code, text = http_get("%s/%d/" % (SITE_BASE, y))
+        if code == "200":
+            site_rows = parse_site_records(text)
+        elif code == "404":
+            site_rows = "missing"
+        else:
+            site_rows = None
+        sf = None if counts is None else int(counts.get(str(y), 0))
+        st, why = classify_year(len(rows), site_rows, len(fmap), sf)
+        res.append({"year": y, "table_rows": len(rows), "site_rows": site_rows, "table_files": len(fmap),
+                    "server_files": sf, "status": st, "why": why})
+    return res
+
+
+def print_site_vs_table(res):
+    print("\nСверка таблиц с сайтом (строки: таблица / сайт, файлы: по ссылкам / на сервере):")
+    for r in res:
+        sr = "нет страницы" if r["site_rows"] == "missing" else ("?" if r["site_rows"] is None else r["site_rows"])
+        sf = "?" if r["server_files"] is None else r["server_files"]
+        mark = {"ok": "✅", "plus": "⬆️ ПЛЮС в таблице — на сайт добавить", "minus": "❌ МИНУС в таблице — искать потерю",
+                "unknown": "⚠️ не проверено"}[r["status"]]
+        print("  %d: строк %s / %s, файлов %s / %s  %s" % (r["year"], r["table_rows"], sr, r["table_files"], sf, mark))
+        if r["status"] != "ok":
+            for w in r["why"]:
+                print("       - " + w)
+
+
 def update_dirty(g):
-    """Меню 2: обновить сайт для изменённых годов (вынесено в функцию в v1.5, логика прежняя)."""
-    st = load_state()
-    dirty = sorted(st.get("dirty_years", []))
-    if not dirty:
-        print("Изменённых годов нет.")
+    """Меню 2 / BAT 2. v1.6: сначала сверка таблиц с сайтом; годы с ПЛЮСОМ добавляются в очередь сами;
+    годы с МИНУСОМ не публикуются (нужно найти потерю)."""
+    if not server_check():
         return
-    if input("Обновить сайт для %s и залить на сервер? (да/нет): " % dirty).strip().lower() in ("да", "y", "yes"):
-        if publish(g, dirty):
+    res = site_vs_table(g)
+    print_site_vs_table(res)
+    st = load_state()
+    dirty = set(st.get("dirty_years", []))
+    minus = sorted(r["year"] for r in res if r["status"] == "minus")
+    added = sorted(r["year"] for r in res if r["status"] == "plus" and r["year"] not in dirty)
+    if added:
+        print("\nГоды добавлены в очередь по результату сверки: %s" % added)
+        dirty |= set(added)
+        st["dirty_years"] = sorted(dirty)
+        save_state(st)
+    if minus:
+        print("\n❌ На сайте больше, чем в таблице: %s. Публикация этих лет НЕ предлагается — сайт повторил бы потерю." % minus)
+        print("   Пришлите этот вывод Claude: нужно найти, какие строки пропали из таблицы, и восстановить их.")
+    todo = sorted(dirty - set(minus))
+    if not todo:
+        print("\nИзменённых годов нет, сайт совпадает с таблицами." if not minus else "\nПубликовать нечего.")
+        return
+    if input("\nОбновить сайт для %s и залить на сервер? (да/нет): " % todo).strip().lower() in ("да", "y", "yes"):
+        if publish(g, todo):
             st = load_state()
-            st["dirty_years"] = [y for y in st["dirty_years"] if y not in dirty]
-            st.setdefault("history", []).append({"t": datetime.now().isoformat(timespec="seconds"), "published": dirty})
+            st["dirty_years"] = [y for y in st.get("dirty_years", []) if y not in todo]
+            st.setdefault("history", []).append({"t": datetime.now().isoformat(timespec="seconds"), "published": todo})
             save_state(st)
 
 
